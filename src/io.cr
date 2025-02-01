@@ -49,7 +49,7 @@ require "c/errno"
 # An `IO` can be set an encoding with the `#set_encoding` method. When this is
 # set, all string operations (`gets`, `gets_to_end`, `read_char`, `<<`, `print`, `puts`
 # `printf`) will write in the given encoding, and read from the given encoding.
-# Byte operations (`read`, `write`, `read_byte`, `write_byte`) never do
+# Byte operations (`read`, `write`, `read_byte`, `write_byte`, `getb_to_end`) never do
 # encoding/decoding operations.
 #
 # If an encoding is not set, the default one is UTF-8.
@@ -58,6 +58,9 @@ require "c/errno"
 # avoided, as string operations might need to read extra bytes in order to get characters
 # in the given encoding.
 abstract class IO
+  # Default size used for generic stream buffers.
+  DEFAULT_BUFFER_SIZE = 32768
+
   # Argument to a `seek` operation.
   enum Seek
     # Seeks to an absolute location
@@ -149,7 +152,7 @@ abstract class IO
   #   reader.gets # => "world"
   # end
   # ```
-  def self.pipe(read_blocking = false, write_blocking = false)
+  def self.pipe(read_blocking = false, write_blocking = false, &)
     r, w = IO.pipe(read_blocking, write_blocking)
     begin
       yield r, w
@@ -296,80 +299,77 @@ abstract class IO
   # io.read_char # => nil
   # ```
   def read_char : Char?
-    info = read_char_with_bytesize
+    peek = self.peek unless decoder
+    info = read_char_with_bytesize(peek)
     info ? info[0] : nil
   end
 
-  private def read_char_with_bytesize
-    # For UTF-8 encoding, try to see if we can peek 4 bytes.
-    # If so, this will be faster than reading byte per byte.
-    if !decoder && (peek = self.peek)
-      if peek.empty?
-        return nil
-      else
-        return read_char_with_bytesize_peek(peek)
-      end
-    else
-      read_char_with_bytesize_slow
-    end
-  end
+  # :nodoc:
+  # See also: `Char::Reader#decode_char_at`.
+  private def read_char_with_bytesize(peek = nil)
+    first = peek_or_read_utf8(peek, 0)
+    return nil unless first
+    first = first.to_u32
 
-  private def read_char_with_bytesize_peek(peek)
-    first = peek[0].to_u32
-    skip(1)
     if first < 0x80
       return first.unsafe_chr, 1
     end
 
-    second = peek_or_read_masked(peek, 1)
+    if first < 0xc2
+      raise InvalidByteSequenceError.new("Unexpected byte 0x#{first.to_s(16)} in UTF-8 byte sequence")
+    end
+
+    second = peek_or_read_utf8_masked(peek, 1)
+
     if first < 0xe0
-      return ((first & 0x1f) << 6 | second).unsafe_chr, 2
+      return ((first << 6) &+ (second &- 0x3080)).unsafe_chr, 2
     end
 
-    third = peek_or_read_masked(peek, 2)
+    third = peek_or_read_utf8_masked(peek, 2)
+
     if first < 0xf0
-      return ((first & 0x0f) << 12 | (second << 6) | third).unsafe_chr, 3
+      if first == 0xe0 && second < 0xa0
+        raise InvalidByteSequenceError.new("Overlong UTF-8 encoding")
+      end
+
+      if first == 0xed && second >= 0xa0
+        raise InvalidByteSequenceError.new("Invalid UTF-8 codepoint")
+      end
+
+      return ((first << 12) &+ (second << 6) &+ (third &- 0xE2080)).unsafe_chr, 3
     end
 
-    fourth = peek_or_read_masked(peek, 3)
-    if first < 0xf8
-      return ((first & 0x07) << 18 | (second << 12) | (third << 6) | fourth).unsafe_chr, 4
+    if first < 0xf5
+      if first == 0xf0 && second < 0x90
+        raise InvalidByteSequenceError.new("Overlong UTF-8 encoding")
+      end
+
+      if first == 0xf4 && second >= 0x90
+        raise InvalidByteSequenceError.new("Invalid UTF-8 codepoint")
+      end
+
+      fourth = peek_or_read_utf8_masked(peek, 3)
+      return ((first << 18) &+ (second << 12) &+ (third << 6) &+ (fourth &- 0x3C82080)).unsafe_chr, 4
     end
 
     raise InvalidByteSequenceError.new("Unexpected byte 0x#{first.to_s(16)} in UTF-8 byte sequence")
   end
 
-  private def read_char_with_bytesize_slow
-    first = read_utf8_byte
-    return nil unless first
-
-    first = first.to_u32
-    return first.unsafe_chr, 1 if first < 0x80
-
-    second = read_utf8_masked_byte
-    return ((first & 0x1f) << 6 | second).unsafe_chr, 2 if first < 0xe0
-
-    third = read_utf8_masked_byte
-    return ((first & 0x0f) << 12 | (second << 6) | third).unsafe_chr, 3 if first < 0xf0
-
-    fourth = read_utf8_masked_byte
-    return ((first & 0x07) << 18 | (second << 12) | (third << 6) | fourth).unsafe_chr, 4 if first < 0xf8
-
-    raise InvalidByteSequenceError.new("Unexpected byte 0x#{first.to_s(16)} in UTF-8 byte sequence")
-  end
-
-  private def read_utf8_masked_byte
-    byte = read_utf8_byte || raise InvalidByteSequenceError.new("Incomplete UTF-8 byte sequence")
-    (byte & 0x3f).to_u32
-  end
-
-  private def peek_or_read_masked(peek, index)
-    if byte = peek[index]?
+  private def peek_or_read_utf8(peek, index)
+    if peek && (byte = peek[index]?)
       skip(1)
-      (byte & 0x3f).to_u32
+      byte
     else
-      read_utf8_masked_byte
+      read_utf8_byte
     end
+  end
+
+  private def peek_or_read_utf8_masked(peek, index)
+    byte = peek_or_read_utf8(peek, index) || raise InvalidByteSequenceError.new("Incomplete UTF-8 byte sequence")
+    if (byte & 0xc0) != 0x80
+      raise InvalidByteSequenceError.new("Unexpected continuation byte 0x#{byte.to_s(16)} in UTF-8 byte sequence")
+    end
+    byte.to_u32
   end
 
   # Reads a single decoded UTF-8 byte from this `IO`.
@@ -433,6 +433,8 @@ abstract class IO
   # io.read_string(6) # raises IO::EOFError
   # ```
   def read_string(bytesize : Int) : String
+    return "" if bytesize == 0
+
     String.new(bytesize) do |ptr|
       if decoder = decoder()
         read = decoder.read_utf8(self, Slice.new(ptr, bytesize))
@@ -449,7 +451,7 @@ abstract class IO
   # Peeks into this IO, if possible.
   #
   # It returns:
-  # - `nil` if this IO isn't peekable
+  # - `nil` if this IO isn't peekable at this moment or at all
   # - an empty slice if it is, but EOF was reached
   # - a non-empty slice if some data can be peeked
   #
@@ -463,8 +465,21 @@ abstract class IO
     nil
   end
 
-  # Writes a slice of UTF-8 encoded bytes to this `IO`, using the current encoding.
-  def write_utf8(slice : Bytes) : Nil
+  # Writes the contents of *slice*, interpreted as a sequence of UTF-8 or ASCII
+  # characters, into this `IO`. The contents are transcoded into this `IO`'s
+  # current encoding.
+  #
+  # ```
+  # bytes = "你".to_slice # => Bytes[228, 189, 160]
+  #
+  # io = IO::Memory.new
+  # io.set_encoding("GB2312")
+  # io.write_string(bytes)
+  # io.to_slice # => Bytes[196, 227]
+  #
+  # "你".encode("GB2312") # => Bytes[196, 227]
+  # ```
+  def write_string(slice : Bytes) : Nil
     if encoder = encoder()
       encoder.write(self, slice)
     else
@@ -472,6 +487,12 @@ abstract class IO
     end
 
     nil
+  end
+
+  # :ditto:
+  @[Deprecated("Use `#write_string` instead.")]
+  def write_utf8(slice : Bytes) : Nil
+    write_string(slice)
   end
 
   private def encoder
@@ -530,6 +551,7 @@ abstract class IO
   # ```
   # io = IO::Memory.new "hello world"
   # io.gets_to_end # => "hello world"
+  # io.gets_to_end # => ""
   # ```
   def gets_to_end : String
     String.build do |str|
@@ -541,12 +563,22 @@ abstract class IO
           decoder.write(str)
         end
       else
-        buffer = uninitialized UInt8[4096]
-        while (read_bytes = read(buffer.to_slice)) > 0
-          str.write buffer.to_slice[0, read_bytes]
-        end
+        IO.copy(self, str)
       end
     end
+  end
+
+  # Reads the rest of this `IO` data as a writable `Bytes`.
+  #
+  # ```
+  # io = IO::Memory.new Bytes[0, 1, 3, 6, 10, 15]
+  # io.getb_to_end # => Bytes[0, 1, 3, 6, 10, 15]
+  # io.getb_to_end # => Bytes[]
+  # ```
+  def getb_to_end : Bytes
+    io = IO::Memory.new
+    IO.copy(self, io)
+    io.to_slice
   end
 
   # Reads a line from this `IO`. A line is terminated by the `\n` character.
@@ -683,7 +715,15 @@ abstract class IO
           peek = self.peek
         end
 
-        if !peek || peek.empty?
+        unless peek
+          # If for some reason this IO became unpeekable,
+          # default to the slow method. One example where this can
+          # happen is `IO::Delimited`.
+          gets_slow(delimiter, limit, chomp, buffer)
+          break
+        end
+
+        if peek.empty?
           if buffer.bytesize == 0
             return nil
           else
@@ -708,21 +748,27 @@ abstract class IO
   end
 
   private def gets_slow(delimiter : Char, limit, chomp)
+    buffer = String::Builder.new
+    bytes_read = gets_slow(delimiter, limit, chomp, buffer)
+    buffer.to_s if bytes_read
+  end
+
+  private def gets_slow(delimiter : Char, limit, chomp, buffer : String::Builder) : Bool
+    bytes_read = false
     chomp_rn = delimiter == '\n' && chomp
 
-    buffer = String::Builder.new
-    total = 0
     while true
-      info = read_char_with_bytesize_slow
+      info = read_char_with_bytesize
       unless info
-        return buffer.empty? ? nil : buffer.to_s
+        break
       end
 
       char, char_bytesize = info
+      bytes_read = true
 
       # Consider the case of \r\n when the delimiter is \n and chomp = true
       if chomp_rn && char == '\r'
-        info2 = read_char_with_bytesize_slow
+        info2 = read_char_with_bytesize
         unless info2
           buffer << char
           break
@@ -734,11 +780,16 @@ abstract class IO
         end
 
         buffer << '\r'
-        total += char_bytesize
-        break if total >= limit
+
+        break if char_bytesize >= limit
+        limit -= char_bytesize
 
         buffer << char2
-        total += char_bytesize2
+
+        break if char_bytesize2 >= limit
+        limit -= char_bytesize2
+
+        next
       elsif char == delimiter
         buffer << char unless chomp
         break
@@ -746,10 +797,11 @@ abstract class IO
         buffer << char
       end
 
-      total += char_bytesize
-      break if total >= limit
+      break if char_bytesize >= limit
+      limit -= char_bytesize
     end
-    buffer.to_s
+
+    bytes_read
   end
 
   # Reads until *delimiter* is found or the end of the `IO` is reached.
@@ -769,7 +821,7 @@ abstract class IO
 
     # One byte: use gets(Char)
     if delimiter.bytesize == 1
-      return gets(delimiter.unsafe_byte_at(0).unsafe_chr, chomp: chomp)
+      return gets(delimiter.to_unsafe[0].unsafe_chr, chomp: chomp)
     end
 
     # One char: use gets(Char)
@@ -815,9 +867,9 @@ abstract class IO
   # io.skip(1) # raises IO::EOFError
   # ```
   def skip(bytes_count : Int) : Nil
-    buffer = uninitialized UInt8[4096]
+    buffer = uninitialized UInt8[DEFAULT_BUFFER_SIZE]
     while bytes_count > 0
-      read_count = read(buffer.to_slice[0, Math.min(bytes_count, 4096)])
+      read_count = read(buffer.to_slice[0, Math.min(bytes_count, buffer.size)])
       raise IO::EOFError.new if read_count == 0
 
       bytes_count -= read_count
@@ -827,7 +879,7 @@ abstract class IO
   # Reads and discards bytes from `self` until there
   # are no more bytes.
   def skip_to_end : Nil
-    buffer = uninitialized UInt8[4096]
+    buffer = uninitialized UInt8[DEFAULT_BUFFER_SIZE]
     while read(buffer.to_slice) > 0
     end
   end
@@ -940,7 +992,7 @@ abstract class IO
   # あ
   # め
   # ```
-  def each_char : Nil
+  def each_char(&) : Nil
     while char = read_char
       yield char
     end
@@ -975,7 +1027,7 @@ abstract class IO
   # 129
   # 130
   # ```
-  def each_byte : Nil
+  def each_byte(&) : Nil
     while byte = read_byte
       yield byte
     end
@@ -1010,10 +1062,7 @@ abstract class IO
   # String operations (`gets`, `gets_to_end`, `read_char`, `<<`, `print`, `puts`
   # `printf`) will use this encoding.
   def set_encoding(encoding : String, invalid : Symbol? = nil) : Nil
-    if invalid != :skip && (
-         encoding.compare("UTF-8", case_insensitive: true) == 0 ||
-         encoding.compare("UTF8", case_insensitive: true) == 0
-       )
+    if utf8_encoding?(encoding, invalid)
       @encoding = nil
     else
       @encoding = EncodingOptions.new(encoding, invalid)
@@ -1028,6 +1077,13 @@ abstract class IO
   # Returns this `IO`'s encoding. The default is `UTF-8`.
   def encoding : String
     @encoding.try(&.name) || "UTF-8"
+  end
+
+  private def utf8_encoding?(encoding : String, invalid : Symbol? = nil) : Bool
+    invalid.nil? && (
+      encoding.compare("UTF-8", case_insensitive: true) == 0 ||
+        encoding.compare("UTF8", case_insensitive: true) == 0
+    )
   end
 
   # :nodoc:
@@ -1115,7 +1171,7 @@ abstract class IO
   # io2.to_s # => "hello"
   # ```
   def self.copy(src, dst) : Int64
-    buffer = uninitialized UInt8[4096]
+    buffer = uninitialized UInt8[DEFAULT_BUFFER_SIZE]
     count = 0_i64
     while (len = src.read(buffer.to_slice).to_i32) > 0
       dst.write buffer.to_slice[0, len]
@@ -1139,7 +1195,7 @@ abstract class IO
 
     limit = limit.to_i64
 
-    buffer = uninitialized UInt8[4096]
+    buffer = uninitialized UInt8[DEFAULT_BUFFER_SIZE]
     remaining = limit
     while (len = src.read(buffer.to_slice[0, Math.min(buffer.size, Math.max(remaining, 0))])) > 0
       dst.write buffer.to_slice[0, len]
@@ -1163,11 +1219,14 @@ abstract class IO
 
     while true
       read1 = stream1.read(buf1.to_slice)
+      if read1.zero?
+        # First stream is EOF, check if the second has more.
+        return stream2.read_byte.nil?
+      end
       read2 = stream2.read_fully?(buf2.to_slice[0, read1])
       return false unless read2
 
       return false if buf1.to_unsafe.memcmp(buf2.to_unsafe, read1) != 0
-      return true if read1 == 0
     end
   end
 

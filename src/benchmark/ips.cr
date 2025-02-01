@@ -14,17 +14,20 @@ module Benchmark
   module IPS
     class Job
       # List of all entries in the benchmark.
-      # After #execute, these are populated with the resulting statistics.
+      # After `#execute`, these are populated with the resulting statistics.
       property items : Array(Entry)
 
       @warmup_time : Time::Span
       @calculation_time : Time::Span
 
-      def initialize(calculation = 5, warmup = 2, interactive = STDOUT.tty?)
+      def initialize(calculation @calculation_time : Time::Span = 5.seconds, warmup @warmup_time : Time::Span = 2.seconds, interactive : Bool = STDOUT.tty?)
         @interactive = !!interactive
-        @warmup_time = warmup.seconds
-        @calculation_time = calculation.seconds
         @items = [] of Entry
+      end
+
+      @[Deprecated("Use `.new(Time::Span, Time::Span, Bool)` instead.")]
+      def self.new(calculation = 5, warmup = 2, interactive = STDOUT.tty?)
+        new(calculation.seconds, warmup.seconds, !!interactive)
       end
 
       # Adds code to be benchmarked
@@ -115,7 +118,7 @@ module Benchmark
       end
 
       private def run_comparison
-        fastest = ran_items.max_by { |i| i.mean }
+        fastest = ran_items.max_by(&.mean)
         ran_items.each do |item|
           item.slower = (fastest.mean / item.mean).to_f
         end
@@ -129,7 +132,7 @@ module Benchmark
       # Code to be benchmarked
       property action : ->
 
-      # Number of cycles needed to run for approx 100ms
+      # Number of cycles needed to run `action` for approximately 100ms.
       # Calculated during the warmup stage
       property! cycles : Int32
 
@@ -172,12 +175,12 @@ module Benchmark
         cycles.times { action.call }
       end
 
-      def set_cycles(duration, iterations)
+      def set_cycles(duration, iterations) : Nil
         @cycles = (iterations / duration.total_milliseconds * 100).to_i
         @cycles = 1 if cycles <= 0
       end
 
-      def calculate_stats(samples)
+      def calculate_stats(samples) : Nil
         @ran = true
         @size = samples.size
         @mean = samples.sum.to_f / size.to_f
